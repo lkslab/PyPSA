@@ -1183,6 +1183,37 @@ def test_deduplicate_names_renames_clash_and_warns(caplog):
     assert "Renamed 1 component names" in caplog.records[0].message
 
 
+def test_file_load_keeps_deduplicated_names(tmp_path):
+    from pypsa.network.names import unchecked_names
+
+    n = pypsa.Network()
+    n.add("Bus", ["b0", "b1"])
+    with unchecked_names(n):
+        n.add("Load", "b0", bus="b0")
+        n.add("Store", "b0", bus="b0")
+        n.add("Link", "b1", bus0="b0", bus1="b1")
+    path = tmp_path / "clashing.nc"
+    n.export_to_netcdf(path)
+
+    m = pypsa.Network(path)
+
+    assert m.deduplicated_names == {
+        "Link": {"b1": "b1-Link"},
+        "Load": {"b0": "b0-Load"},
+        "Store": {"b0": "b0-Store"},
+    }
+
+
+def test_file_load_without_clash_keeps_empty_map(tmp_path):
+    n = pypsa.Network()
+    n.add("Bus", "b0")
+    n.add("Load", "l0", bus="b0")
+    path = tmp_path / "clean.nc"
+    n.export_to_netcdf(path)
+
+    assert pypsa.Network(path).deduplicated_names == {}
+
+
 def test_deduplicate_names_counter_path():
     """A candidate name already present in the clashing type gets a counter suffix."""
     from pypsa.network.names import deduplicate_names, unchecked_names

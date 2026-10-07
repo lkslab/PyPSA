@@ -365,7 +365,7 @@ class NetworkIOMixin(_NetworkABC):
 
                 imported_components.append(list_name)
 
-        deduplicate_names(cast("Network", self))
+        self.deduplicated_names = deduplicate_names(cast("Network", self))
         self._broadcast_standard_types()
 
         logger.info(
