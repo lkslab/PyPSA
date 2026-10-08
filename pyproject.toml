@@ -120,7 +120,7 @@ include = ["pypsa"]
 "pypsa" = ["py.typed"]
 
 [tool.uv.sources]
-datarecord = { git = "https://github.com/lkstrp/datarecord", branch = "dev-lkstrp" }
+datarecord = { git = "https://github.com/lkslab/datarecord", branch = "dev-lkstrp" }
 
 # Pytest settings
 
