@@ -283,6 +283,30 @@ def _drop_default_columns(
             frame.loc[~keep, col] = np.nan
 
 
+def _constant_labels(count: int, label: str) -> pd.Categorical:
+    """One label repeated `count` times, as codes rather than `count` objects."""
+    return pd.Categorical.from_codes(np.zeros(count, dtype=np.int8), categories=[label])
+
+
+def _string_labels(values: pd.Series) -> pd.Series:
+    """`astype(str)` that keeps a categorical column categorical.
+
+    A stacked label column is categorical (`_stack_series`), so its labels are
+    converted once, as categories, rather than expanded to a Python string per
+    row. Colliding renames (an int `1` beside a `"1"`) fall back to the
+    expanded form, as any non-categorical column does.
+    """
+    if isinstance(values.dtype, pd.CategoricalDtype):
+        categories = values.cat.categories
+        as_str = categories.astype(str)
+        if as_str.is_unique:
+            if as_str.equals(categories):
+                return values
+            return values.cat.rename_categories(as_str)
+        values = values.astype(object)
+    return values.astype(str)
+
+
 def _scenario_varying(c: Components, columns: list[str]) -> set[str]:
     """Which static columns hold more than one value across scenarios."""
     index = c.static.index
@@ -805,7 +829,7 @@ class NetworkRecord:
         long = self._stack_column(c, attr)
         if long is None:
             return None
-        long["attribute"] = attribute
+        long["attribute"] = _constant_labels(len(long), attribute)
         return long
 
     def _per_port_rows(
@@ -813,26 +837,56 @@ class NetworkRecord:
     ) -> pd.DataFrame:
         """Connection-addressed long rows for a per-port attribute."""
         ports = port_columns(c)
+        attached = {
+            col: buses
+            for col in columns
+            if not (buses := _attached_buses(c, ports[col][1])).empty
+        }
+        if not attached:
+            return pd.DataFrame(
+                columns=[_ENTITY, _BUS, "attribute", "breakpoint", "value"]
+            )
+        # One category set across every port, so the per-port frames
+        # concatenate without expanding out of the categorical form.
+        shared = pd.Index(
+            pd.unique(pd.concat(list(attached.values()), ignore_index=True))
+        )
         frames = []
-        for col in columns:
-            _stem, port = ports[col]
-            buses = _attached_buses(c, port)
-            if buses.empty:
-                continue
+        for col, buses in attached.items():
             rows = self._stack_column(c, col)
             if rows is None or rows.empty:
                 continue
             buses = buses.copy()
             buses.index = buses.index.astype(str)
-            rows[_BUS] = rows[_ENTITY].map(buses)
-            rows = rows[rows[_BUS].notna()]
-            rows["attribute"] = attribute
+            rows[_BUS] = self._bus_labels(rows[_ENTITY], buses, shared)
+            mask = rows[_BUS].notna()
+            if not mask.all():
+                rows = rows[mask]
+            rows["attribute"] = _constant_labels(len(rows), attribute)
             frames.append(rows)
         if not frames:
             return pd.DataFrame(
                 columns=[_ENTITY, _BUS, "attribute", "breakpoint", "value"]
             )
         return pd.concat(frames, ignore_index=True)
+
+    @staticmethod
+    def _bus_labels(
+        entities: pd.Series, buses: pd.Series, shared: pd.Index
+    ) -> pd.Series | pd.Categorical:
+        """Each row's attached bus, mapped per entity *category* where there is one.
+
+        Row-level `map` would build one Python object per row; mapping the
+        categories and re-indexing their codes keeps the result categorical,
+        over the `shared` across-ports category set. An entity without a bus on
+        this port comes back NaN (code -1), for the caller to drop.
+        """
+        if not isinstance(entities.dtype, pd.CategoricalDtype):
+            return entities.map(buses)
+        per_category = shared.get_indexer(entities.cat.categories.map(buses))
+        return pd.Categorical.from_codes(
+            per_category[entities.cat.codes], categories=shared
+        )
 
     def _stack_column(self, c: Components, attr: str) -> pd.DataFrame | None:
         """`(entity, breakpoint, value)` rows for one raw PyPSA column: series, static and piecewise data, stacked."""
@@ -869,7 +923,7 @@ class NetworkRecord:
         if not frames:
             return None
         long = pd.concat(frames, ignore_index=True)
-        long[_ENTITY] = long[_ENTITY].astype(str)
+        long[_ENTITY] = _string_labels(long[_ENTITY])
         if "breakpoint" not in long.columns:
             long["breakpoint"] = None
         return long
@@ -909,11 +963,37 @@ class NetworkRecord:
         return self._custom_column(c, record_attr)
 
     def _stack_series(self, c: Components, wide: pd.DataFrame) -> pd.DataFrame:
-        """Melt a `snapshots x components` frame into long rows."""
-        stochastic = isinstance(wide.columns, pd.MultiIndex)
-        wide = wide.rename_axis(columns=[SCENARIO, _ENTITY] if stochastic else _ENTITY)
-        stacked = wide.stack(level=list(range(wide.columns.nlevels)), future_stack=True)
-        long = stacked.rename("value").reset_index()
+        """Melt a `snapshots x components` frame into long rows.
+
+        Columnar rather than `stack()`: the values are the frame's buffer
+        raveled, the snapshots one repeated typed array, and the entity and
+        scenario labels categoricals - codes per row, each label stored once.
+        The stacked form held a Python object per cell, which on a full-year
+        multi-port output was the whole write path's peak memory.
+        """
+        n_rows, n_cols = wide.shape
+        columns: dict[str, Any] = {}
+        index = wide.index
+        if isinstance(index, pd.MultiIndex):
+            for level, name in enumerate(index.names):
+                columns[name] = np.repeat(
+                    index.get_level_values(level).to_numpy(), n_cols
+                )
+        else:
+            columns[index.name or "index"] = np.repeat(index.to_numpy(), n_cols)
+        labels = wide.columns
+        if isinstance(labels, pd.MultiIndex):
+            for level, name in enumerate((SCENARIO, _ENTITY)):
+                columns[name] = pd.Categorical.from_codes(
+                    np.tile(labels.codes[level], n_rows),
+                    categories=labels.levels[level],
+                )
+        else:
+            columns[_ENTITY] = pd.Categorical.from_codes(
+                np.tile(np.arange(n_cols, dtype=np.intp), n_rows), categories=labels
+            )
+        columns["value"] = wide.to_numpy().ravel()
+        long = pd.DataFrame(columns)
         if not isinstance(c.snapshots, pd.MultiIndex):
             long = long.rename(columns={"snapshot": TIMESTEP})
         return long
